@@ -710,10 +710,39 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	const auto supported = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         create.usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!supported()) {
+		// Some drivers reject compressed volumes with view-compatibility flags. Drop the optional
+		// flags one at a time; views that need them are refused later by IsValidView.
+		const auto requested = create.flags;
+		for (const auto optional: {vk::ImageCreateFlagBits::e2DArrayCompatible,
+		                           vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+		                           vk::ImageCreateFlagBits::eExtendedUsage}) {
+			if (!(create.flags & optional)) continue;
+			create.flags &= ~vk::ImageCreateFlags {optional};
+			if (supported()) break;
+		}
+		if (!supported()) {
+			create.flags = requested;
+		} else {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "Image: format=%d type=%d usage=0x%x does not support flags=0x%x; "
+				           "using flags=0x%x\n",
+				           static_cast<int>(create.format), static_cast<int>(create.imageType),
+				           static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+				           static_cast<vk::ImageCreateFlags::MaskType>(requested),
+				           static_cast<vk::ImageCreateFlags::MaskType>(create.flags));
+			}
+		}
+	}
+	if (!supported()) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
