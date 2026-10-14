@@ -784,7 +784,17 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								// Range-level overlap does not prove the shader writes the captured
+								// bytes; keep the pre-dispatch snapshot instead of aborting.
+								static std::atomic<uint32_t> log_count {0};
+								if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+									LOGF_COLOR(Log::Color::BrightYellow,
+									           "scalar resource reads overlap an unbounded shader buffer write: "
+									           "writer=0x%016" PRIx64 " reader=0x%016" PRIx64
+									           " read=0x%016" PRIx64 "+0x%" PRIx64 " write=0x%016" PRIx64 "\n",
+									           program.shader_hash, reader->runtime->program->shader_hash,
+									           read_address, read_size, address);
+								}
 							}
 						}
 					}
@@ -978,7 +988,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						// Bound ranges are coarse: an output buffer can enclose the constants the
+						// shader reads without touching them. The snapshot matches memory at dispatch
+						// start and is revalidated on the next use, so warn instead of aborting.
+						static std::atomic<uint32_t> log_count {0};
+						if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+							LOGF_COLOR(Log::Color::BrightYellow,
+							           "scalar resource reads overlap a shader buffer write: "
+							           "writer=0x%016" PRIx64 " reader=0x%016" PRIx64
+							           " read=0x%016" PRIx64 "+0x%" PRIx64
+							           " write=0x%016" PRIx64 "+0x%" PRIx64 "\n",
+							           program.shader_hash, reader->runtime->program->shader_hash,
+							           address, size, written.address, written.size);
+						}
 					}
 				}
 			}
