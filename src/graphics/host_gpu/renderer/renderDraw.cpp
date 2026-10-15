@@ -1101,6 +1101,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
+	uint32_t   mesh_chunk_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1120,13 +1121,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		if (draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+		    draw.instance_count > limits.maxMeshWorkGroupTotalCount) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
+		// Large draws are split into several host dispatches; each chunk rebases the draw
+		// parameters so the shader still sees group 0 at the chunk's first input vertex.
+		mesh_chunk_groups = std::min(limits.maxMeshWorkGroupCount[0],
+		                             limits.maxMeshWorkGroupTotalCount / draw.instance_count);
+		// Keep strip parity: chunk starts must fall on an even primitive.
+		mesh_chunk_groups &= ~1u;
+		if (mesh_groups > mesh_chunk_groups &&
+		    (mesh_chunk_groups == 0 ||
+		     mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan))) {
+			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+			     draw.instance_count);
+		}
+		mesh_chunk_groups = std::min(mesh_chunk_groups, mesh_groups);
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
@@ -1182,18 +1194,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
+	const auto push_mesh_draw = [&](uint32_t first_group) {
+		const auto& mesh = state.vertex_info[0].mesh;
+		// Fast launch advances one vertex per group; otherwise each group consumes a fixed
+		// run of input vertices.
+		const uint64_t vertex_skip =
+		    mesh.fast_launch ? uint64_t {first_group}
+		                     : uint64_t {first_group} * mesh.primitives_per_group *
+		                           mesh.InputPrimitiveStep();
+		const auto skip = static_cast<uint32_t>(std::min<uint64_t>(vertex_skip, draw.index_count));
+		const uint64_t index_address =
+		    index_source.address + (draw.IsIndexed() ? uint64_t {skip} *
+		                                                   index_source.guest_element_size
+		                                             : 0u);
 		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+		    draw.index_count - (mesh.fast_launch ? 0u : skip),
+		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                     : emit.first_vertex + static_cast<uint32_t>(vertex_skip),
 		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
+		    static_cast<uint32_t>(index_address), static_cast<uint32_t>(index_address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
+	};
+	if (mesh_active) {
+		push_mesh_draw(0);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1214,7 +1241,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		for (uint32_t first = 0; first < mesh_groups; first += mesh_chunk_groups) {
+			if (first != 0) push_mesh_draw(first);
+			vk_buffer.drawMeshTasksEXT(std::min(mesh_chunk_groups, mesh_groups - first),
+			                           draw.instance_count, 1);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
