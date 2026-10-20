@@ -1274,6 +1274,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		requests[i - 1].cfg->mutex.Unlock();
 	}
 	if (due) {
+		if (tracy::ProfilerAvailable()) {
+			FrameMark;
+			Profiler::PlotCounters();
+		}
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 		if (Config::GraphicsDebugDumpEnabled() &&
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {

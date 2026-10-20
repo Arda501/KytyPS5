@@ -13,6 +13,9 @@
 namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+// Reads a 32- or 64-bit value as the command processor sees it, including labels that are
+// recorded but not yet written to guest memory.
+uint64_t ReadCommandProcessorMemory(const volatile void* address, uint32_t size);
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -129,6 +132,8 @@ public:
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
+	template <typename T>
+	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,

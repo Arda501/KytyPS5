@@ -120,7 +120,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
+      m_buffer_cache(buffer_cache), m_metadata_clear(graphics, scheduler),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
@@ -503,6 +503,7 @@ void TextureCache::PrepareImageCopy(Image& image) {
 }
 
 void TextureCache::RefreshCopySource(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& image = m_slot_images[id];
 	RefreshImage(id);
 	if (image.IsDefinitelyCpuDirty()) {
@@ -586,6 +587,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	KYTY_PROFILER_FUNCTION();
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -926,6 +928,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	KYTY_PROFILER_FUNCTION();
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -961,7 +964,8 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
-	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	KYTY_PROFILER_FUNCTION();
+	auto&       destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	if (binding != BindingType::DepthTarget) {
@@ -1025,6 +1029,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 }
 
 void TextureCache::InitializeImage(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -1086,28 +1091,73 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
-	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	// Codes that decode to a clear of this view; any other metadata leaves the image alone.
+	std::array<uint8_t, MetadataClearChecker::PredicatesPerSlice>             codes {};
+	std::array<vk::ClearColorValue, MetadataClearChecker::PredicatesPerSlice> colors {};
+	uint32_t                                                                  code_count = 0;
+	static constexpr std::array<uint8_t, 5> DccCodes {0x00, 0x20, 0x40, 0x80, 0xc0};
+	static constexpr std::array<uint8_t, 1> CmaskCodes {0x00};
+	for (const auto code: desc.info.metadata.kind == ImageMetadataKind::Cmask
+	                          ? std::span<const uint8_t> {CmaskCodes}
+							  : std::span<const uint8_t> {DccCodes}) {
+		if (DecodeColorClear(desc, code, colors[code_count])) {
+			codes[code_count++] = code;
+		}
+	}
+	if (code_count == 0) {
+		return;
 	}
 	const auto slice_size = range.size / layers;
+	// A constant fill decides the metadata without its bytes: use it while it is still the
+	// latest write, either because the GPU has not run it yet or because the bytes only exist
+	// in a GPU buffer. Bytes the GPU wrote otherwise are checked on the GPU when the clear can
+	// be predicated on them. Failing both, finish native metadata writes before reading
+	// backing bytes. That can submit the scheduler, so discovery runs before final draw
+	// uploads and never holds the texture lock across it.
+	const bool gpu_modified = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	uint32_t   fill_value   = 0;
+	uint64_t   fill_tick    = 0;
+	const bool from_fill =
+	    m_buffer_cache.FindFill(range.address, range.size, fill_value, fill_tick) &&
+	    (gpu_modified || !m_scheduler.IsFree(fill_tick));
+	if (from_fill) {
+		Profiler::Count(Profiler::Counter::MetadataFromFill);
+	} else if (gpu_modified) {
+		if (MaterializeColorClearOnGpu(id, desc, first, image_first, count, slice_size,
+		                               std::span {codes.data(), code_count},
+		                               std::span {colors.data(), code_count})) {
+			Profiler::Count(Profiler::Counter::MetadataOnGpu);
+			return;
+		}
+		Profiler::Count(Profiler::Counter::ReadbacksMetadata);
+		KYTY_PROFILER_BLOCK("MetadataReadback");
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		uint8_t    code    = 0;
+		if (from_fill) {
+			code = static_cast<uint8_t>(fill_value);
+			if (fill_value != code * 0x01010101u) {
+				continue;
+			}
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		std::vector<uint8_t> bytes;
+		if (!from_fill) {
+			bytes.resize(slice_size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1124,7 +1174,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
-		if (desc.type != BindingType::VideoOut) {
+		if (desc.type != BindingType::VideoOut && from_fill) {
+			// The fill may not have run yet; a fill orders the keys after it.
+			m_buffer_cache.FillBuffer(address, slice_size, 0xffffffffu, false);
+		} else if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
@@ -1132,7 +1185,60 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+                                              uint32_t image_first, uint32_t count,
+                                              uint64_t slice_size, std::span<const uint8_t> codes,
+                                              std::span<const vk::ClearColorValue> colors) {
+	// Video-out metadata keeps its codes, and depth clears need transfer clears, which
+	// conditional rendering does not cover.
+	if (!m_metadata_clear.Enabled() || desc.type == BindingType::VideoOut || desc.info.IsDepth() ||
+	    desc.view_info.level_count != 1) {
+		return false;
+	}
+	const auto level = desc.view_info.base_level;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image  = m_slot_images[id];
+		const bool       volume = image.info.IsVolume();
+		if (image.depth_id || image.backing.image == nullptr || image.info.IsDepth() ||
+		    level >= image.info.resources.levels ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
+		    (volume && !(image.backing.flags & vk::ImageCreateFlagBits::e2DArrayCompatible))) {
+			return false;
+		}
+		const auto layers =
+		    volume ? std::max(image.info.extent.depth >> level, 1u) : image.backing.layers;
+		if (image_first >= layers || count > layers - image_first) {
+			return false;
+		}
+	}
+	const auto address            = desc.info.metadata.range.address + slice_size * first;
+	const auto [metadata, offset] = m_buffer_cache.ObtainBuffer(address, slice_size * count, true);
+	if (metadata == nullptr) {
+		EXIT("TextureCache: failed to obtain color metadata\n");
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto predicates =
+	    m_metadata_clear.Check(command.Handle(), *metadata, offset, slice_size, count, codes, true);
+	{
+		std::scoped_lock                                                       lock {m_lock};
+		std::array<ConditionalClear, MetadataClearChecker::PredicatesPerSlice> clears {};
+		for (size_t k = 0; k < codes.size(); k++) {
+			clears[k] = {colors[k], predicates + k * sizeof(uint32_t)};
+		}
+		ClearImageConditional(command, id, desc.view_info.format, level, image_first, count,
+		                      std::span {clears.data(), codes.size()},
+		                      MetadataClearChecker::PredicatesPerSlice * sizeof(uint32_t));
+	}
+	// Matched slices are expanded and the rest hold no clear; either way nothing is left to
+	// apply until the metadata is written again.
+	m_buffer_cache.RecordFill(address, slice_size * count, 0xffffffffu);
+	return true;
+}
+
 void TextureCache::RefreshImage(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1210,6 +1316,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1479,6 +1586,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
+	KYTY_PROFILER_FUNCTION();
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
@@ -1487,6 +1595,68 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+}
+
+void TextureCache::ClearImageConditional(CommandBuffer& command, ImageId id, vk::Format format,
+                                         uint32_t level, uint32_t first_layer, uint32_t layer_count,
+                                         std::span<const ConditionalClear> clears,
+                                         uint64_t                          predicate_stride) {
+	auto&      image  = m_slot_images[id];
+	const auto layers = image.info.IsVolume() ? std::max(image.info.extent.depth >> level, 1u)
+	                                          : image.backing.layers;
+	EXIT_IF(command.IsInvalid() || image.depth_id || image.info.IsDepth() ||
+	        level >= image.info.resources.levels || layer_count == 0 || first_layer >= layers ||
+	        layer_count > layers - first_layer);
+	TrackImage(id);
+	// The clear may not happen, so the image has to hold its contents either way.
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
+			EXIT("TextureCache: image clear retained guest ownership\n");
+		}
+	}
+	command.EndRendering();
+	ImageViewInfo view {};
+	view.format      = format;
+	view.type        = layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	view.base_level  = level;
+	view.base_layer  = first_layer;
+	view.layer_count = layer_count;
+	view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, command.Handle());
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = vk::Extent2D {std::max(image.info.extent.width >> level, 1u),
+	                                               std::max(image.info.extent.height >> level, 1u)};
+	rendering.layerCount           = layer_count;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	const auto handle              = command.Handle();
+	handle.beginRendering(&rendering);
+	for (uint32_t layer = 0; layer < layer_count; layer++) {
+		for (const auto& clear: clears) {
+			vk::ConditionalRenderingBeginInfoEXT conditional {};
+			conditional.buffer = m_metadata_clear.PredicateBuffer();
+			conditional.offset = clear.predicate_offset + layer * predicate_stride;
+			handle.beginConditionalRenderingEXT(&conditional);
+			vk::ClearAttachment clear_attachment {};
+			clear_attachment.aspectMask       = vk::ImageAspectFlagBits::eColor;
+			clear_attachment.colorAttachment  = 0;
+			clear_attachment.clearValue.color = clear.color;
+			const vk::ClearRect rect {rendering.renderArea, layer, 1};
+			handle.clearAttachments(1, &clear_attachment, 1, &rect);
+			handle.endConditionalRenderingEXT();
+		}
+	}
+	handle.endRendering();
+	CommitGpuWrite(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1655,6 +1825,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	KYTY_PROFILER_FUNCTION();
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.linear_slice_stride;
@@ -1738,6 +1909,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (!selected) {
 		return false;
@@ -1784,6 +1956,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1826,6 +1999,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -1935,6 +2109,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -1995,6 +2170,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	KYTY_PROFILER_FUNCTION();
 	if (!m_readback_linear_images) {
 		return;
 	}

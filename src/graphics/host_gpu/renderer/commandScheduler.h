@@ -29,7 +29,15 @@ public:
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
-	uint64_t       Submit(SubmitInfo submit = {});
+	// Counts a recorded draw or dispatch. Work only reaches the GPU when it is submitted, so
+	// FlushIfBusy submits once enough has been recorded: the GPU then runs it while the
+	// command processor records more, and later waits only cover the newest work.
+	void NoteRecordedWork() noexcept { m_recorded_work++; }
+	// Asks FlushIfBusy to submit after the current command: it wrote memory the command
+	// processor is likely to wait for, which then only waits for work up to that command.
+	void     RequestEarlyFlush() noexcept { m_early_flush = true; }
+	void     FlushIfBusy();
+	uint64_t Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -93,6 +101,8 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
+	uint32_t                     m_recorded_work = 0;
+	bool                         m_early_flush   = false;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

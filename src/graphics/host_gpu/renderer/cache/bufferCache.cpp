@@ -14,7 +14,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -118,6 +121,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		m_shared_buffer_count += buffer.IsShared() ? 1 : 0;
+		// Its pages may have stayed CPU-modified while no buffer covered them.
+		m_memory_tracker.QueueCpuModifiedRange(buffer.CpuAddress(), buffer.Size());
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -132,6 +138,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		m_shared_buffer_count -= buffer.IsShared() ? 1 : 0;
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -159,6 +166,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
+	// The CPU may change the bytes once it owns them.
+	ForgetFills(vaddr, size);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -175,6 +185,17 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    });
 	if (copies.empty()) {
 		return false;
+	}
+	m_download_stats[buffer.CpuAddress()]++;
+	NoteCpuDownload(buffer);
+
+	if (buffer.IsShared()) {
+		// The GPU writes guest memory directly; only wait for its last write to the buffer.
+		// Readers usually come after a completion label, so that work has already finished.
+		if constexpr (!async) {
+			m_scheduler.Wait(buffer.last_gpu_write_tick);
+		}
+		return true;
 	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
@@ -289,8 +310,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
+		Profiler::Count(Profiler::Counter::ReadbacksWriteFault);
+		ReadMemory(vaddr, size, true);
+	});
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -363,7 +386,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
 			// Reserve space in the incoming stream's direction of growth.
-			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			// The old buffer extending left of the request predicts growth to the right, and vice
+			// versa.
 			if (expands_left) {
 				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
 				                                       : LibKernel::Memory::kExtendedMemoryBase +
@@ -390,12 +414,28 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	// Keep the access history, or buffers that keep growing would never be shared.
+	new_buffer.gpu_written |= overlap.gpu_written;
+	new_buffer.command_readback |= overlap.command_readback;
+	if (overlap.last_cpu_access_tick != UINT64_MAX &&
+	    (new_buffer.last_cpu_access_tick == UINT64_MAX ||
+	     overlap.last_cpu_access_tick > new_buffer.last_cpu_access_tick ||
+	     (overlap.last_cpu_access_tick == new_buffer.last_cpu_access_tick &&
+	      overlap.cpu_access_frames > new_buffer.cpu_access_frames))) {
+		new_buffer.last_cpu_access_tick = overlap.last_cpu_access_tick;
+		new_buffer.cpu_access_frames    = overlap.cpu_access_frames;
+		new_buffer.cpu_access_history   = overlap.cpu_access_history;
+	}
+	if (overlap.IsShared()) {
+		m_share_candidates.push_back(new_buffer.CpuAddress());
+	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -412,13 +452,24 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		m_create_stats[overlap.begin].joins++;
 	}
+	m_create_stats[overlap.begin].creates++;
 	Register(id);
 	return id;
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (buffer.IsShared()) {
+		// Guest memory is the buffer, so there is nothing to upload. GPU writes still take
+		// ownership of their pages: CPU and command-processor reads must fault and wait.
+		if (is_written) {
+			m_memory_tracker.ForEachUploadRange(
+			    vaddr, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+		}
+		return is_texel_buffer && !is_written && SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -430,6 +481,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		NoteCpuAccess(buffer);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -483,6 +535,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -490,7 +543,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !IsRegionShared(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -510,12 +563,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (buffer.command_readback) {
+			m_scheduler.RequestEarlyFlush();
+		}
+		buffer.gpu_written         = true;
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ForgetFills(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -542,6 +602,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	KYTY_PROFILER_FUNCTION();
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -557,15 +618,65 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Access the guest mapping so write faults invalidate cached buffers and images. Shared
+		// memory is written at once too, so command-processor reads see the fill.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		ForgetFills(vaddr, size);
+		return;
+	} else if (auto* shared = FindSharedBuffer(vaddr, size)) {
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+		MarkSharedGpuWrite(*shared, vaddr, size);
+		shared->Fill(shared->Offset(vaddr), size, value);
+	} else {
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+		auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+		dst->Fill(dst_offset, size, value);
+	}
+	RecordFill(vaddr, size, value);
+}
+
+void BufferCache::RecordFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	std::scoped_lock lock {m_fill_mutex};
+	ForgetFillsLocked(vaddr, size);
+	if (m_fill_records.size() >= 4096) {
+		m_fill_records.clear();
+	}
+	m_fill_records[vaddr] = {vaddr + size, value, m_scheduler.CurrentTick()};
+}
+
+void BufferCache::ForgetFills(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock {m_fill_mutex};
+	ForgetFillsLocked(vaddr, size);
+}
+
+void BufferCache::ForgetFillsLocked(uint64_t vaddr, uint64_t size) {
+	if (m_fill_records.empty()) {
 		return;
 	}
+	const auto end = vaddr + size;
+	auto       it  = m_fill_records.lower_bound(vaddr);
+	if (it != m_fill_records.begin() && std::prev(it)->second.end > vaddr) {
+		--it;
+	}
+	while (it != m_fill_records.end() && it->first < end) {
+		it = m_fill_records.erase(it);
+	}
+}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
-	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
-	dst->Fill(dst_offset, size, value);
+bool BufferCache::FindFill(uint64_t vaddr, uint64_t size, uint32_t& value, uint64_t& tick) {
+	std::scoped_lock lock {m_fill_mutex};
+	auto             it = m_fill_records.upper_bound(vaddr);
+	if (it == m_fill_records.begin()) {
+		return false;
+	}
+	--it;
+	if (it->second.end < vaddr + size) {
+		return false;
+	}
+	value = it->second.value;
+	tick  = it->second.tick;
+	return true;
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -581,6 +692,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	if (dst_memory) {
+		ForgetFills(dst_vaddr, size);
+	}
+	// CPU-current bytes are copied at once, also into shared memory, so command-processor
+	// reads see them; GPU-written ones take the GPU's order.
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
@@ -596,8 +712,14 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
-	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
-	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	auto* shared_dst       = dst_memory ? FindSharedBuffer(dst_vaddr, size) : nullptr;
+	auto [dst, dst_offset] = shared_dst != nullptr
+	                             ? std::pair {shared_dst, shared_dst->Offset(dst_vaddr)}
+	                         : dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
+	                                      : std::pair {&m_gds_buffer, dst_vaddr};
+	if (shared_dst != nullptr) {
+		MarkSharedGpuWrite(*shared_dst, dst_vaddr, size);
+	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
@@ -628,6 +750,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	KYTY_PROFILER_FUNCTION();
+	UpdateSharing();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -655,6 +779,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
+			m_create_stats[buffer.CpuAddress()].retires++;
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}
@@ -686,6 +811,7 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -699,6 +825,258 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+}
+
+void BufferCache::SynchronizeCpuModifiedBuffers(const RangeSet& mapped, bool full) {
+	KYTY_PROFILER_FUNCTION();
+	if (!m_memory_tracker.TakeCpuModifiedRanges(m_cpu_modified_ranges)) {
+		full = true;
+	}
+	Profiler::Count(Profiler::Counter::BdaSynchronizations);
+	Profiler::Count(full ? Profiler::Counter::BdaFullScans : Profiler::Counter::BdaSyncRanges,
+	                full ? 1 : m_cpu_modified_ranges.size());
+	const auto synchronize = [this](uint64_t start, uint64_t end) {
+		SynchronizeBuffersInRange(start, end - start);
+	};
+	if (full) {
+		mapped.ForEach(synchronize);
+		return;
+	}
+	for (const auto& [vaddr, size]: m_cpu_modified_ranges) {
+		mapped.ForEachInRange(vaddr, size, synchronize);
+	}
+}
+
+Buffer* BufferCache::FindSharedBuffer(uint64_t vaddr, uint64_t size) {
+	if (m_shared_buffer_count == 0) {
+		return nullptr;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> CACHING_PAGEBITS);
+	if (owner == nullptr || !*owner) {
+		return nullptr;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	return buffer.IsShared() && buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
+}
+
+bool BufferCache::IsRegionShared(uint64_t vaddr, uint64_t size) {
+	if (m_shared_buffer_count == 0 || size == 0) {
+		return false;
+	}
+	const auto last = (vaddr + size - 1) >> CACHING_PAGEBITS;
+	for (auto page = vaddr >> CACHING_PAGEBITS; page <= last; page++) {
+		const auto* owner = m_page_table.Find(page);
+		if (owner != nullptr && *owner && m_slot_buffers[*owner].IsShared()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool BufferCache::WriteLabel(uint64_t vaddr, const void* data, uint32_t size) {
+	ForgetFills(vaddr, size);
+	if (IsRegionShared(vaddr, size)) {
+		return LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+	}
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> CACHING_PAGEBITS);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    !LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	buffer.Update(buffer.Offset(vaddr), size, data);
+	return true;
+}
+
+void BufferCache::UnmapSharedBuffers(uint64_t vaddr, uint64_t size) {
+	if (m_shared_buffer_count == 0) {
+		return;
+	}
+	std::vector<BufferId> shared;
+	auto                  it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsShared() && buffer.CpuAddress() + buffer.Size() > vaddr) {
+			shared.push_back(it->second);
+		}
+	}
+	// The buffers pin the old physical pages; a later mapping must not see them.
+	for (const auto id: shared) {
+		DeleteBuffer(id);
+	}
+}
+
+void BufferCache::NoteCommandReadback(uint64_t vaddr, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> CACHING_PAGEBITS);
+	if (owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+		m_slot_buffers[*owner].command_readback = true;
+	}
+}
+
+void BufferCache::MarkSharedGpuWrite(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
+	buffer.gpu_written         = true;
+	buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+	m_gpu_modified_ranges.Add(vaddr, size);
+}
+
+void BufferCache::NoteCpuAccess(Buffer& buffer) {
+	// CPU uploads or readbacks in this many of the last eight frames make a buffer worth
+	// sharing. Guest frames and cache ticks do not align, so require no unbroken run.
+	constexpr int ShareAfterFrames = 3;
+	if (buffer.last_cpu_access_tick == m_gc_tick) {
+		return;
+	}
+	const auto age = buffer.last_cpu_access_tick == UINT64_MAX
+	                     ? 8
+	                     : std::min<uint64_t>(m_gc_tick - buffer.last_cpu_access_tick, 8);
+	buffer.cpu_access_history   = static_cast<uint8_t>((buffer.cpu_access_history << age) | 1u);
+	buffer.last_cpu_access_tick = m_gc_tick;
+	buffer.cpu_access_frames    = static_cast<uint32_t>(std::popcount(buffer.cpu_access_history));
+	if (buffer.cpu_access_frames == ShareAfterFrames && !buffer.share_failed) {
+		m_share_candidates.push_back(buffer.CpuAddress());
+	}
+}
+
+void BufferCache::NoteCpuDownload(Buffer& buffer) {
+	// Every download drains the GPU queue, so a burst of them is reason enough to share.
+	constexpr uint32_t ShareAfterDownloads = 16;
+	if (m_gc_tick - buffer.download_window_tick >= 8) {
+		buffer.download_window_tick = m_gc_tick;
+		buffer.recent_downloads     = 0;
+	}
+	if (++buffer.recent_downloads == ShareAfterDownloads && !buffer.share_failed) {
+		m_share_candidates.push_back(buffer.CpuAddress());
+	}
+	NoteCpuAccess(buffer);
+}
+
+void BufferCache::UpdateSharing() {
+	const auto for_each_candidate = [this](std::vector<uint64_t>& addresses, auto&& action) {
+		const auto candidates = std::exchange(addresses, {});
+		for (const auto address: candidates) {
+			const auto* owner = m_page_table.Find(address >> CACHING_PAGEBITS);
+			if (owner != nullptr && *owner && m_slot_buffers[*owner].CpuAddress() == address) {
+				action(*owner);
+			}
+		}
+	};
+	for_each_candidate(m_share_candidates, [this](BufferId id) { ShareBuffer(id); });
+	if (tracy::ProfilerAvailable()) {
+		TracyPlot("Shared buffers", static_cast<int64_t>(m_shared_buffer_count));
+		TracyPlot("Shared memory imports", static_cast<int64_t>(SharedMemoryImportCount()));
+		ReportFaultOwners();
+	}
+}
+
+void BufferCache::ReportFaultOwners() {
+	// Sorts last frame's write-fault pages by the kind of buffer that owns them.
+	static uint64_t       cursor = 0;
+	std::vector<uint64_t> pages;
+	Profiler::CopyWriteFaultPages(cursor, pages);
+	std::sort(pages.begin(), pages.end());
+	pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+	std::array<int64_t, 5> owners {};
+	for (const auto page: pages) {
+		const auto* owner = m_page_table.Find((page << 12u) >> CACHING_PAGEBITS);
+		if (owner == nullptr || !*owner) {
+			owners[0]++;
+			continue;
+		}
+		const auto& buffer = m_slot_buffers[*owner];
+		owners[buffer.IsShared() ? 1 : buffer.gpu_written ? 2 : buffer.share_failed ? 3 : 4]++;
+	}
+	static constexpr const char* Names[] = {
+	    "Fault pages: no buffer", "Fault pages: shared", "Fault pages: GPU-written buffer",
+	    "Fault pages: share failed", "Fault pages: not yet shared"};
+	for (size_t i = 0; i < owners.size(); i++) {
+		TracyPlot(Names[i], owners[i]);
+	}
+	if (m_gc_tick % 30 == 0) {
+		std::vector<std::pair<uint32_t, uint64_t>> downloads;
+		for (const auto& [address, count]: m_download_stats) {
+			downloads.emplace_back(count, address);
+		}
+		std::sort(downloads.rbegin(), downloads.rend());
+		std::printf("Downloads in the last 30 frames by buffer:\n");
+		for (size_t i = 0; i < std::min<size_t>(downloads.size(), 10); i++) {
+			const auto* owner = m_page_table.Find(downloads[i].second >> CACHING_PAGEBITS);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			const auto& buffer = m_slot_buffers[*owner];
+			std::printf("  %6u  0x%012" PRIx64 " %8" PRIu64 " KiB shared=%d gpu_written=%d "
+			            "failed=%d access_frames=%u\n",
+			            downloads[i].first, downloads[i].second, buffer.Size() >> 10u,
+			            buffer.IsShared(), buffer.gpu_written, buffer.share_failed,
+			            buffer.cpu_access_frames);
+		}
+		m_download_stats.clear();
+		std::vector<std::pair<uint32_t, uint64_t>> creates;
+		for (const auto& [address, stats]: m_create_stats) {
+			creates.emplace_back(stats.creates, address);
+		}
+		std::sort(creates.rbegin(), creates.rend());
+		std::printf("Buffer creations in the last 30 frames (gc used %" PRIu64
+		            " MiB, trigger %" PRIu64 " MiB):\n",
+		            m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u);
+		for (size_t i = 0; i < std::min<size_t>(creates.size(), 6); i++) {
+			const auto& stats = m_create_stats[creates[i].second];
+			std::printf("  0x%012" PRIx64 " creates %u joins %u retires %u\n", creates[i].second,
+			            stats.creates, stats.joins, stats.retires);
+		}
+		m_create_stats.clear();
+		std::printf("Write-fault pages by owner: none %" PRId64 ", shared %" PRId64
+		            ", GPU-written %" PRId64 ", share failed %" PRId64 ", pending %" PRId64
+		            " | shared buffers %zu in %" PRIu64 " imports\n",
+		            owners[0], owners[1], owners[2], owners[3], owners[4], m_shared_buffer_count,
+		            SharedMemoryImportCount());
+	}
+}
+
+void BufferCache::ShareBuffer(BufferId id) {
+	auto& buffer = m_slot_buffers[id];
+	if (buffer.IsShared() || buffer.share_failed) {
+		return;
+	}
+	const auto   vaddr = buffer.CpuAddress();
+	const auto   size  = buffer.Size();
+	SharedMemory shared;
+	if (!ImportGuestMemory(m_graphics, vaddr, size,
+	                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, shared)) {
+		buffer.share_failed = true;
+		return;
+	}
+	static uint32_t log_count = 0;
+	if (log_count++ < 32) {
+		std::printf("GPU: sharing guest buffer 0x%016" PRIx64 " (%" PRIu64 " KiB)\n", vaddr,
+		            size >> 10u);
+	}
+	// Guest memory becomes the only copy, so bytes the GPU modified must reach it first.
+	if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	}
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
+	    m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		ReleaseSharedMemory(m_graphics, shared);
+		buffer.share_failed = true;
+		return;
+	}
+	const auto stream_score = buffer.StreamScore();
+	// Leave the pages writable for good: CPU writes now reach the GPU without faults.
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	DeleteBuffer(id);
+	const auto shared_id = m_slot_buffers.insert(m_graphics, m_scheduler, vaddr, size, shared);
+	m_slot_buffers[shared_id].IncreaseStreamScore(stream_score);
+	SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[shared_id].Handle(),
+	                     "Kyty.SharedGameBuffer[guest=0x{:016x} size=0x{:x}]", vaddr, size);
+	Register(shared_id);
 }
 
 } // namespace Libs::Graphics

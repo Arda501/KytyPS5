@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -17,6 +18,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
@@ -892,6 +894,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			Profiler::Count(Profiler::Counter::ReadbacksBacking);
 			buffers.ReadMemory(vaddr, size);
 		}
 	}
@@ -930,12 +933,37 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+static std::string DescribeGuestRange(uint64_t vaddr) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	VirtualRanges::Range                  range {};
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range)) {
+		return "unknown";
+	}
+	char name[KERNEL_MAXIMUM_NAME_LENGTH + 1] = {};
+	CopyVirtualRangeName(name, range.name);
+	return fmt::format("{:<9} 0x{:012x}+0x{:09x} prot={} type={} '{}'",
+	                   magic_enum::enum_name(range.type), range.start, range.size, range.protection,
+	                   range.memory_type, name);
+}
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
+	if (resources != nullptr) {
+		Profiler::SetWriteFaultDescriber(DescribeGuestRange);
+	}
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	if (access == Graphics::PageFaultAccess::Write) {
+		Profiler::Count(Profiler::Counter::GpuWriteFaults);
+		Profiler::RecordWriteFault(fault_vaddr);
+		if (Graphics::GuestGpu::IsGpuThread()) {
+			Profiler::Count(Profiler::Counter::GpuThreadWriteFaults);
+		}
+	} else {
+		Profiler::Count(Profiler::Counter::GpuReadFaults);
+	}
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
@@ -972,6 +1000,64 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<false>(vaddr, data, size);
+}
+
+bool GetDirectMemoryBacking(uint64_t vaddr, uint64_t size, int& fd, uint64_t& backing_size,
+                            std::vector<std::pair<uint64_t, uint64_t>>& segments) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	segments.clear();
+	if (g_guest_address_space == nullptr ||
+	    !g_guest_address_space->GetBackingSegments(vaddr, size, segments)) {
+		return false;
+	}
+	fd           = g_guest_address_space->GetBackingFd();
+	backing_size = g_guest_address_space->GetBackingSize();
+	return fd >= 0;
+#else
+	(void)vaddr;
+	(void)size;
+	(void)fd;
+	(void)backing_size;
+	(void)segments;
+	return false;
+#endif
+}
+
+bool GetGuestMappingWindow(uint64_t vaddr, uint64_t size, uint64_t window_size, uint64_t& base,
+                           uint64_t& size_out) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || size == 0 || window_size == 0 ||
+	    !g_virtual_ranges->Query(vaddr, 0, &range) || range.type != VirtualRangeType::Direct) {
+		return false;
+	}
+	// Grow over adjacent direct mappings, within the aligned window.
+	const auto window_start = vaddr / window_size * window_size;
+	const auto window_end   = window_start + window_size;
+	auto       start        = range.start;
+	auto       end          = range.start + range.size;
+	while (start > window_start) {
+		VirtualRanges::Range previous {};
+		if (!g_virtual_ranges->Query(start - 1, 0, &previous) ||
+		    previous.type != VirtualRangeType::Direct || previous.start + previous.size != start) {
+			break;
+		}
+		start = previous.start;
+	}
+	while (end < window_end) {
+		VirtualRanges::Range next {};
+		if (!g_virtual_ranges->Query(end, 0, &next) || next.type != VirtualRangeType::Direct ||
+		    next.start != end) {
+			break;
+		}
+		end = next.start + next.size;
+	}
+	base = std::max(start, window_start);
+	end  = std::min(end, window_end);
+	if (vaddr < base || vaddr + size > end) {
+		return false;
+	}
+	size_out = end - base;
+	return true;
 }
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {

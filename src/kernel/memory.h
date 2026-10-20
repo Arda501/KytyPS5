@@ -5,6 +5,10 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -107,17 +111,25 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void                   SetFlexibleMemorySize(uint64_t size);
-int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
-                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-int UnmapAmmMemory(uint64_t vaddr, size_t size);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void SetFlexibleMemorySize(uint64_t size);
+int  AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
+                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
+int  MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int  UnmapAmmMemory(uint64_t vaddr, size_t size);
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// The backing file, its size, and the (offset, size) pieces of a range fully mapped from direct
+// memory.
+bool GetDirectMemoryBacking(uint64_t vaddr, uint64_t size, int& fd, uint64_t& backing_size,
+                            std::vector<std::pair<uint64_t, uint64_t>>& segments);
+// The part of the guest mapping holding [vaddr, vaddr + size) that lies in the same aligned
+// window of window_size bytes. Fails when the range leaves its mapping or window.
+bool GetGuestMappingWindow(uint64_t vaddr, uint64_t size, uint64_t window_size, uint64_t& base,
+                           uint64_t& size_out);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);

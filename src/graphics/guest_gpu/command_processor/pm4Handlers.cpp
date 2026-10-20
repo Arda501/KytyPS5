@@ -1475,7 +1475,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(
+	    ReadCommandProcessorMemory(compare_addr, sizeof(uint64_t)), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -2008,8 +2009,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			if (raw_cmd_offset == 0x24au && value == 0u) {
 				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
 				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
+					Log::WriteToConsoleAndLog("\t diagnostic: ignoring indirect CX {0x24a, 0}; "
+					                          "hardware effect unresolved\n");
 				}
 				continue;
 			}

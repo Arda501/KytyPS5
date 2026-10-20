@@ -25,10 +25,12 @@
 #include <atomic>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -37,6 +39,17 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+// Labels recorded for queue work the host GPU has not finished yet. Every guest queue feeds one
+// in-order host queue, so later command-processor reads see them at once, as the guest GPU
+// would; guest memory only changes on completion, for CPU readers. GPU thread only.
+struct PendingLabel {
+	uint32_t size     = 0;
+	uint64_t value    = 0;
+	uint64_t sequence = 0;
+};
+static std::map<uint64_t, PendingLabel> g_pending_labels;
+static uint64_t                         g_pending_label_sequence = 0;
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -85,6 +98,22 @@ void GuestGpu::Shutdown() {
 		m_thread.join();
 	}
 	m_shutdown_complete = true;
+}
+
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
 }
 
 bool GuestGpu::IsStopping() {
@@ -291,6 +320,29 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+uint64_t ReadCommandProcessorMemory(const volatile void* address, uint32_t size) {
+	EXIT_IF(size != sizeof(uint32_t) && size != sizeof(uint64_t));
+	uint64_t value = size == sizeof(uint64_t) ? *static_cast<const volatile uint64_t*>(address)
+	                                          : *static_cast<const volatile uint32_t*>(address);
+	if (g_pending_labels.empty()) {
+		return value;
+	}
+	const auto begin = reinterpret_cast<uint64_t>(address);
+	auto*      bytes = reinterpret_cast<uint8_t*>(&value);
+	for (auto it = g_pending_labels.lower_bound(begin >= 7 ? begin - 7 : 0);
+	     it != g_pending_labels.end() && it->first < begin + size; ++it) {
+		const auto label_end = it->first + it->second.size;
+		const auto from      = std::max(begin, it->first);
+		const auto to        = std::min(begin + size, label_end);
+		if (from < to) {
+			std::memcpy(bytes + (from - begin),
+			            reinterpret_cast<const uint8_t*>(&it->second.value) + (from - it->first),
+			            to - from);
+		}
+	}
+	return value;
+}
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -315,7 +367,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadCommandProcessorMemory(addr, sizeof(T)), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -341,6 +393,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+
+	const auto bytes = (write_one_address ? 1u : dw_num) * sizeof(uint32_t);
+	// Write at once, also into memory shared with the GPU: later command-processor reads,
+	// such as the shader resource tables read at draw time, must see it, as on the guest.
+	m_renderer.GetBufferCache().ForgetFills(reinterpret_cast<uint64_t>(dst), bytes);
 
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
@@ -451,14 +508,24 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		bool                         flush_idle     = false;
+		bool                         all_blocked    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (gpu->m_unflushed_submissions == 0) {
+					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				} else if (!gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 1000)) {
+					// The guest went quiet; the batch must reach the GPU for its labels.
+					flush_idle = true;
+					break;
+				}
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (flush_idle) {
+				// Flush below, outside the queue lock.
+			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
@@ -478,22 +545,35 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					// Every queue waits. Their labels may sit in the unsubmitted batch.
+					flush_idle  = gpu->m_unflushed_submissions != 0;
+					all_blocked = flush_idle;
+					if (!flush_idle) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
 						}
 					}
-					continue;
+					if (!flush_idle) {
+						continue;
+					}
+				} else {
+					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+					submission  = std::move(queue.front());
+					queue.pop_front();
+					gpu->m_submission_count--;
+					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+					gpu->m_processing = true;
+					has_submission    = true;
 				}
-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
-				queue.pop_front();
-				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
-				has_submission    = true;
 			}
+		}
+		if (flush_idle) {
+			gpu->FlushSubmissions(all_blocked ? Profiler::Counter::SubmitsBatchAllBlocked
+			                                  : Profiler::Counter::SubmitsBatchIdle);
+			continue;
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
@@ -506,7 +586,22 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
 
+			bool flush = false;
+			{
+				Common::LockGuard lock(gpu->m_queue_mutex);
+				flush = gpu->ShouldFlushLocked();
+			}
+			if (flush) {
+				gpu->FlushSubmissions(gpu->m_new_wait ? Profiler::Counter::SubmitsBatchNewWait
+				                                      : Profiler::Counter::SubmitsBatchFull);
+			}
 			Common::LockGuard lock(gpu->m_queue_mutex);
+			// The command may have written a label that a blocked submission waits for.
+			for (auto& queue: gpu->m_queues) {
+				if (!queue.empty()) {
+					queue.front().blocked = false;
+				}
+			}
 			gpu->m_processing = false;
 			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_idle.SignalAll();
@@ -517,23 +612,52 @@ void GuestGpu::ThreadRun(void* data) {
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
 
-		Common::LockGuard lock(gpu->m_queue_mutex);
-		if (!complete) {
-			submission.blocked = true;
-			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
-			gpu->m_submission_count++;
-		} else {
-			for (auto& queue: gpu->m_queues) {
-				if (!queue.empty()) {
-					queue.front().blocked = false;
+		bool flush = false;
+		{
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			if (!complete) {
+				submission.blocked = true;
+				gpu->m_new_wait |= !std::exchange(submission.waiting, true);
+				gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+				gpu->m_submission_count++;
+			} else {
+				for (auto& queue: gpu->m_queues) {
+					if (!queue.empty()) {
+						queue.front().blocked = false;
+					}
 				}
 			}
+			flush = gpu->ShouldFlushLocked();
 		}
+		if (flush) {
+			gpu->FlushSubmissions(gpu->m_new_wait ? Profiler::Counter::SubmitsBatchNewWait
+			                                      : Profiler::Counter::SubmitsBatchFull);
+		}
+		Common::LockGuard lock(gpu->m_queue_mutex);
 		gpu->m_processing = false;
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 			gpu->m_idle.SignalAll();
 		}
 	}
+}
+
+bool GuestGpu::ShouldFlushLocked() const {
+	// Each queue submission costs the host far more than recording, so batch guest submissions;
+	// the idle wait in ThreadRun flushes once the guest stops submitting.
+	constexpr uint32_t MaxUnflushedSubmissions = 32;
+	if (m_unflushed_submissions == 0) {
+		return false;
+	}
+	// A queue that just started waiting may need the batch for its label. Later flushes do not
+	// help it: whatever it waits for is either submitted already or still to be recorded.
+	return m_new_wait || m_unflushed_submissions >= MaxUnflushedSubmissions;
+}
+
+void GuestGpu::FlushSubmissions(Profiler::Counter reason) {
+	Profiler::Count(reason);
+	m_new_wait              = false;
+	m_unflushed_submissions = 0;
+	m_renderer.GetCommandScheduler().Flush();
 }
 
 bool GuestGpu::Process(Submission& submission) {
@@ -575,9 +699,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
-			if (progressed) {
-				cp.BufferFlush();
-			}
+			m_unflushed_submissions += progressed ? 1 : 0;
 			break;
 		}
 		case SubmissionType::Compute: {
@@ -596,9 +718,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
-			}
+			m_unflushed_submissions += submission.command_execution.MadeProgress() ? 1 : 0;
 			break;
 		}
 		case SubmissionType::FlipPreparation:
@@ -745,6 +865,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (execution.m_suspended) {
 			return;
 		}
+		GetScheduler().FlushIfBusy();
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
@@ -895,6 +1016,34 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// Draw from the arguments in GPU memory when the host can: reading them here waits for
+	// the GPU work that wrote them.
+	static const bool native_indirect = std::getenv("KYTY_NO_NATIVE_INDIRECT") == nullptr;
+	const auto        args_address    = m_draw_indirect_args_base_addr + data_offset;
+	if (native_indirect && indexed && max_count_or_count != 0 && m_index_buffer_size != 0 &&
+	    m_index_type_and_size != 2 && (args_address & 3u) == 0 && (stride_in_bytes & 3u) == 0 &&
+	    stride_in_bytes >= sizeof(DrawIndexedIndirectArgs) &&
+	    (count_addr == nullptr || (reinterpret_cast<uint64_t>(count_addr) & 3u) == 0)) {
+		const IndirectDrawSource source {.args_address  = args_address,
+		                                 .stride        = stride_in_bytes,
+		                                 .max_count     = max_count_or_count,
+		                                 .count_address = reinterpret_cast<uint64_t>(count_addr),
+		                                 .patched_registers = {registers.vertex_offset,
+		                                                       registers.instance_offset,
+		                                                       registers.index_offset}};
+		DrawIndexArgs draw {.index_count         = m_index_buffer_size,
+		                    .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+		                    .instance_count      = 1,
+		                    .index_type_and_size = m_index_type_and_size,
+		                    .offset_source       = DrawOffsetSource::IndirectArgs,
+		                    .indirect            = &source};
+		if (m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), draw)) {
+			Profiler::Count(Profiler::Counter::NativeIndirectDraws);
+			return;
+		}
+	}
+
+	m_renderer.GetBufferCache().NoteCommandReadback(args_address, stride_in_bytes);
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;
@@ -1073,15 +1222,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	}
 
 	auto write32 = [&] {
-		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
-		auto  data = static_cast<uint32_t>(value);
-		EXIT_IF(dst == nullptr);
+		EXIT_IF(dst_gpu_addr == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
-
-		if (with_interrupt) {
-			TriggerEopEventAtEndOfPipe(interrupt_context_id);
-		}
+		WriteLabelAtEndOfPipe(static_cast<uint32_t*>(dst_gpu_addr), static_cast<uint32_t>(value),
+		                      with_interrupt, interrupt_context_id);
 	};
 
 	switch (event_write_source) {
@@ -1117,14 +1261,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					value = Sync::ReadReferenceClock();
 				}
 				auto write64 = [&] {
-					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					EXIT_IF(dst == nullptr);
+					EXIT_IF(dst_gpu_addr == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
-
-					if (with_interrupt) {
-						TriggerEopEventAtEndOfPipe(interrupt_context_id);
-					}
+					WriteLabelAtEndOfPipe(static_cast<uint64_t*>(dst_gpu_addr),
+					                      static_cast<uint64_t>(value), with_interrupt,
+					                      interrupt_context_id);
 				};
 
 				switch (cache_action) {
@@ -1235,6 +1376,37 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+}
+
+template <typename T>
+void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
+                                             uint32_t interrupt_context_id) {
+	// The guest treats the label as proof that earlier work finished, and may then reuse the
+	// memory that work reads. Write it once the host GPU really is done, on the GPU thread so
+	// the write is tracked like any other command-processor write, then raise the interrupt.
+	// Command-processor reads see it at once through the pending labels.
+	const auto address        = reinterpret_cast<uint64_t>(dst);
+	const auto sequence       = ++g_pending_label_sequence;
+	g_pending_labels[address] = {sizeof(T), static_cast<uint64_t>(value), sequence};
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, dst, value, with_interrupt,
+	                                       event_id  = m_interrupt_event_id, interrupt_context_id,
+	                                       sequence] {
+		renderer.RunOnGpuThread(
+		    [&renderer, dst, value, with_interrupt, event_id, interrupt_context_id, sequence] {
+			    // A fault on a GPU-modified page would download it and drain the GPU queue.
+			    const auto address = reinterpret_cast<uint64_t>(dst);
+			    if (!renderer.GetBufferCache().WriteLabel(address, &value, sizeof(value))) {
+				    std::memcpy(dst, &value, sizeof(value));
+			    }
+			    if (const auto pending = g_pending_labels.find(address);
+				    pending != g_pending_labels.end() && pending->second.sequence == sequence) {
+				    g_pending_labels.erase(pending);
+			    }
+			    if (with_interrupt) {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    });
+	});
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

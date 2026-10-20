@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -157,6 +158,11 @@ private:
 			return;
 		}
 		previous = protection;
+		if constexpr (!is_read) {
+			for ([[maybe_unused]] const auto run: mask) {
+				Profiler::Count(Profiler::Counter::WriteProtectionRuns);
+			}
+		}
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 

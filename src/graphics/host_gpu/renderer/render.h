@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -48,6 +49,17 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// Arguments of an indirect draw that stay in GPU memory.
+struct IndirectDrawSource {
+	uint64_t args_address = 0;
+	uint32_t stride       = 0;
+	uint32_t max_count    = 0;
+	// Zero when max_count draws are made.
+	uint64_t count_address = 0;
+	// The shader registers the guest command processor writes the draw offsets to.
+	std::array<uint32_t, 3> patched_registers {};
+};
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -57,6 +69,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Set to draw from GPU arguments; index_addr and index_count then cover the index buffer.
+	const IndirectDrawSource* indirect = nullptr;
 };
 
 struct DrawAutoArgs {
@@ -163,7 +177,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	std::unordered_set<uint64_t> m_indirect_declined;
+	// Returns false when a GPU-argument draw cannot be made natively; nothing is drawn then.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {

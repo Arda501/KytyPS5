@@ -2,10 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -176,12 +178,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_PROFILER_FUNCTION();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -192,9 +196,11 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
+		Profiler::Count(Profiler::Counter::SubmitsForWait);
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
@@ -208,6 +214,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	KYTY_PROFILER_FUNCTION();
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -330,8 +337,27 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+void CommandScheduler::FlushIfBusy() {
+	static const uint32_t threshold = [] {
+		const char* value = std::getenv("KYTY_FLUSH_WORK");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
+	}();
+	// Early flushes still need some work behind them to be worth a submission.
+	constexpr uint32_t EarlyFlushWork = 4;
+	const bool         early          = m_early_flush && m_recorded_work >= EarlyFlushWork;
+	if ((!early && (threshold == 0 || m_recorded_work < threshold)) || !Active() ||
+	    m_command.IsInvalid()) {
+		return;
+	}
+	Profiler::Count(early ? Profiler::Counter::SubmitsEarly
+	                      : Profiler::Counter::SubmitsForProgress);
+	Flush();
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	m_recorded_work    = 0;
+	m_early_flush      = false;
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
@@ -339,6 +365,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
+	Profiler::Count(Profiler::Counter::SubmitsTotal);
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);

@@ -121,6 +121,13 @@ public:
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
+	// User-data slots the next vertex programs read from draw parameters; see
+	// ShaderVertexInputInfo::draw_parameter_user_data.
+	void SetDrawParameterUserData(int32_t base_vertex, int32_t base_instance) {
+		m_draw_parameter_user_data[0] = base_vertex;
+		m_draw_parameter_user_data[1] = base_instance;
+	}
+
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
@@ -142,6 +149,7 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	int32_t m_draw_parameter_user_data[2] = {-1, -1};
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -437,6 +438,7 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		Profiler::Count(Profiler::Counter::PermutationsCompiled);
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -656,6 +658,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		std::copy(std::begin(m_draw_parameter_user_data), std::end(m_draw_parameter_user_data),
+		          std::begin(vertex_info[0].draw_parameter_user_data));
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -837,7 +841,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 					break;
 				case ShaderAlphaBlendSource::SourceAlphaOne:
 				case ShaderAlphaBlendSource::SourceAlphaZero:
-					// The second source carries the mapped source factor; its alpha stays logical Sa.
+					// The second source carries the mapped source factor; its alpha stays logical
+					// Sa.
 					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
 					blend.color_destblend =
 					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
@@ -945,6 +950,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	Profiler::Count(Profiler::Counter::PipelinesCreated);
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,

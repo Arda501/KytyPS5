@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/profiler.h"
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -39,6 +40,8 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
+	// Like SendCommand, but leaves command untouched and returns false once shutdown began.
+	bool TrySendCommand(Common::UniqueFunction<void>& command);
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
@@ -65,14 +68,18 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
-		uint64_t                  flip_request_id   = 0;
+		// Blocked at least once; retries of a waiting submission do not count as new waits.
+		bool     waiting         = false;
+		uint64_t flip_request_id = 0;
 	};
 
-	void              Enqueue(Submission submission);
-	void              ProcessCommands();
-	bool              Process(Submission& submission);
-	static void       ThreadRun(void* data);
-	CommandProcessor& GetProcessor(uint32_t queue_id);
+	void               Enqueue(Submission submission);
+	void               ProcessCommands();
+	bool               Process(Submission& submission);
+	[[nodiscard]] bool ShouldFlushLocked() const;
+	void               FlushSubmissions(Profiler::Counter reason);
+	static void        ThreadRun(void* data);
+	CommandProcessor&  GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;
@@ -82,12 +89,16 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
-	uint32_t                                       m_next_queue        = 0;
-	uint32_t                                       m_submission_count  = 0;
-	bool                                           m_processing        = false;
-	bool                                           m_accepting         = true;
-	bool                                           m_stopping          = false;
-	bool                                           m_shutdown_complete = false;
+	uint32_t                                       m_next_queue = 0;
+	// Guest submissions recorded since the last host queue submission.
+	uint32_t m_unflushed_submissions = 0;
+	// A submission started waiting since the last host queue submission.
+	bool     m_new_wait          = false;
+	uint32_t m_submission_count  = 0;
+	bool     m_processing        = false;
+	bool     m_accepting         = true;
+	bool     m_stopping          = false;
+	bool     m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);

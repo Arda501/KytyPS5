@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -33,14 +34,21 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
-		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.Finish();
 		}
+		// Completions may still post label writes to the stopped GPU; it must outlive them.
 		m_command_scheduler.DrainPriorityOperations();
 		m_video_out = nullptr;
+	}
+	m_gpu.reset();
+}
+
+void RenderContext::RunOnGpuThread(Common::UniqueFunction<void>&& command) {
+	if (m_gpu == nullptr || !m_gpu->TrySendCommand(command)) {
+		command();
 	}
 }
 
@@ -65,6 +73,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		Profiler::Count(Profiler::Counter::ReadbacksReadFault);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -90,6 +99,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapped_ranges_changed = true;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -109,10 +119,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
+		m_buffer_cache.UnmapSharedBuffers(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapped_ranges_changed = true;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -129,9 +141,9 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Visiting every mapped buffer per draw dominated frame time; changed ranges suffice.
+	m_buffer_cache.SynchronizeCpuModifiedBuffers(m_mapped_ranges,
+	                                             m_mapped_ranges_changed.exchange(false));
 	m_fault_process_pending = true;
 }
 

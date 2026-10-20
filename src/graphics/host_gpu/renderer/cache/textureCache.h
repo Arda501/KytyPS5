@@ -7,12 +7,14 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/metadataClear.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -153,8 +155,26 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
-	void PrepareImageCopy(Image& image);
-	void RefreshCopySource(ImageId id);
+	struct ConditionalClear {
+		vk::ClearColorValue color;
+		// The conditional-rendering predicate that selects this clear for the first layer.
+		uint64_t predicate_offset;
+	};
+	// Caller holds m_lock. Clears each color layer (volume depth slice) of one mip with the
+	// clears whose predicates in the metadata checker's buffer are set when the GPU runs
+	// them; a layer's predicates follow the previous layer's by predicate_stride bytes.
+	void ClearImageConditional(CommandBuffer& command, ImageId id, vk::Format format,
+	                           uint32_t level, uint32_t first_layer, uint32_t layer_count,
+	                           std::span<const ConditionalClear> clears, uint64_t predicate_stride);
+	// Applies fast clears decided by GPU metadata checks; false when the image or metadata
+	// cannot use them and the caller must read the metadata back instead.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+	                                              uint32_t image_first, uint32_t count,
+	                                              uint64_t                             slice_size,
+	                                              std::span<const uint8_t>             codes,
+	                                              std::span<const vk::ClearColorValue> colors);
+	void               PrepareImageCopy(Image& image);
+	void               RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
@@ -171,6 +191,7 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	MetadataClearChecker                              m_metadata_clear;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;

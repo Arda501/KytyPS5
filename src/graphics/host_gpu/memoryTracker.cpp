@@ -8,7 +8,39 @@ namespace Libs::Graphics {
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
-	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_regions        = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_pending_ranges = std::make_unique<std::pair<uint64_t, uint64_t>[]>(PENDING_RANGE_CAPACITY);
+}
+
+void MemoryTracker::QueueCpuModifiedRange(uint64_t vaddr, uint64_t size) noexcept {
+	std::scoped_lock lock(m_pending_lock);
+	if (m_pending_overflow) {
+		return;
+	}
+	if (m_pending_count != 0) {
+		auto& last = m_pending_ranges[m_pending_count - 1];
+		if (last.first + last.second == vaddr) {
+			last.second += size;
+			return;
+		}
+	}
+	if (m_pending_count == PENDING_RANGE_CAPACITY) {
+		m_pending_overflow = true;
+		return;
+	}
+	m_pending_ranges[m_pending_count++] = {vaddr, size};
+}
+
+bool MemoryTracker::TakeCpuModifiedRanges(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	out.clear();
+	std::scoped_lock lock(m_pending_lock);
+	const bool       complete = !m_pending_overflow;
+	if (complete) {
+		out.assign(m_pending_ranges.get(), m_pending_ranges.get() + m_pending_count);
+	}
+	m_pending_count    = 0;
+	m_pending_overflow = false;
+	return complete;
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -63,6 +95,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// New regions start CPU-modified.
+	QueueCpuModifiedRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	return ptr;
 }
 
@@ -84,9 +118,10 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueCpuModifiedRange(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 
@@ -125,8 +160,9 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueCpuModifiedRange(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 

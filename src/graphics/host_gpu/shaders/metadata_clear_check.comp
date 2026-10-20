@@ -1,0 +1,73 @@
+#version 450
+
+// Decides on the GPU whether color metadata slices still hold a fast clear, so that the
+// clear can be applied with conditional rendering instead of reading the metadata back.
+// One workgroup checks one slice: it is a fast clear when every byte holds the same code
+// and that code is in the list of codes the CPU could decode. Predicate k of the slice is
+// set when the slice holds codes[k]; a matched slice is then marked expanded (0xff).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer metadata_buf {
+    uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer predicate_buf {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Params {
+    uint metadata_offset; // In words, of the first slice.
+    uint slice_words;
+    uint predicate_offset; // In words, of the first slice's predicates.
+    uint code_count;
+    uint codes_lo; // Up to eight codes, one per byte.
+    uint codes_hi;
+    uint write_back;
+} params;
+
+const uint PredicatesPerSlice = 8;
+
+shared uint s_mismatch;
+shared int  s_matched;
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    const uint base  = params.metadata_offset + slice * params.slice_words;
+    const uint lid   = gl_LocalInvocationID.x;
+    const uint first = metadata[base];
+    const uint code  = first & 0xffu;
+    const uint expect = code * 0x01010101u;
+    if (lid == 0) {
+        s_mismatch = first != expect ? 1u : 0u;
+    }
+    barrier();
+    bool mismatch = false;
+    for (uint i = lid; i < params.slice_words && !mismatch; i += gl_WorkGroupSize.x) {
+        mismatch = metadata[base + i] != expect;
+    }
+    if (mismatch) {
+        atomicOr(s_mismatch, 1u);
+    }
+    barrier();
+    if (lid == 0) {
+        int matched = -1;
+        for (uint k = 0; k < PredicatesPerSlice; k++) {
+            const uint packed = k < 4 ? params.codes_lo : params.codes_hi;
+            const uint candidate = (packed >> ((k & 3u) * 8u)) & 0xffu;
+            const bool hit = s_mismatch == 0u && k < params.code_count && candidate == code &&
+                             matched < 0;
+            if (hit) {
+                matched = int(k);
+            }
+            predicates[params.predicate_offset + slice * PredicatesPerSlice + k] = hit ? 1u : 0u;
+        }
+        s_matched = matched;
+    }
+    barrier();
+    if (params.write_back != 0u && s_matched >= 0) {
+        for (uint i = lid; i < params.slice_words; i += gl_WorkGroupSize.x) {
+            metadata[base + i] = 0xffffffffu;
+        }
+    }
+}

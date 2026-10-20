@@ -141,8 +141,11 @@ struct ShaderVertexInputInfo {
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
-	bool                    fetch_external      = false;
-	bool                    fetch_embedded      = false;
+	bool                        fetch_external = false;
+	bool                        fetch_embedded = false;
+	// User-data slots holding the base vertex and the first instance of an indirect draw
+	// whose arguments stay on the GPU: the shader reads them from the draw parameters.
+	int32_t draw_parameter_user_data[2] = {-1, -1};
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

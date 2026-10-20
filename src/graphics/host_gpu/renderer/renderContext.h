@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -54,7 +55,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
-	void               RunGarbageCollector();
+	// Runs command on the guest GPU thread, or inline once that thread stopped accepting work.
+	void RunOnGpuThread(Common::UniqueFunction<void>&& command);
+	void RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -81,6 +84,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	std::atomic_bool          m_mapped_ranges_changed {true};
 	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;

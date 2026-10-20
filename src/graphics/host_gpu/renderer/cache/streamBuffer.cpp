@@ -104,8 +104,22 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               uint64_t size, SharedMemory shared)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_buffer(shared.buffer), m_shared(shared), m_size(size),
+      m_coherent(true) {
+	EXIT_IF(!m_buffer || !IsShared());
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = m_buffer;
+	m_device_address    = graphics.device.getBufferAddress(address_info);
+	EXIT_IF(m_device_address == 0);
+}
+
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (IsShared()) {
+		ReleaseSharedMemory(*m_graphics, m_shared);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -208,6 +222,28 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
 	native.fillBuffer(Handle(), offset, size, value);
+	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
+	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
+void Buffer::Update(uint64_t offset, uint64_t size, const void* data) {
+	if (((offset | size) & 3u) != 0 || size == 0 || size > 65536 || offset > Size() ||
+	    size > Size() - offset) {
+		EXIT("Buffer: invalid update range\n");
+	}
+	auto& command = Scheduler().Current();
+	command.EndRendering();
+	const auto before =
+	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		        vk::AccessFlagBits::eTransferWrite);
+	const auto native = command.Handle();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 1, &before, 0, nullptr);
+	native.updateBuffer(Handle(), offset, size, data);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,

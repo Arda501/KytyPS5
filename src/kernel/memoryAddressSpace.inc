@@ -102,7 +102,8 @@ public:
 			}
 		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		// Sealing lets udmabuf share the backing with the GPU without copies.
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", MFD_ALLOW_SEALING));
 #endif
 		if (m_fd < 0) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
@@ -115,6 +116,11 @@ public:
 			m_fd = -1;
 			return;
 		}
+#if !defined(__APPLE__)
+		if (fcntl(m_fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+			LOGF_COLOR(Log::Color::Yellow, "\t direct-memory backing: sealing failed: %d\n", errno);
+		}
+#endif
 		auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
 		if (backing == MAP_FAILED) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: writable alias failed: %d\n",
@@ -271,6 +277,45 @@ public:
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
 			const auto  offset = entry.backing_offset + current - entry.vaddr;
 			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
+			current += bytes;
+		}
+		return true;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	[[nodiscard]] int GetFd() const { return m_fd; }
+#endif
+
+	// Appends the backing (offset, size) pieces of a fully backed range, merging adjacent ones.
+	bool GetBackingSegments(uint64_t vaddr, uint64_t size,
+	                        std::vector<std::pair<uint64_t, uint64_t>>& segments) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		const auto       end   = vaddr + size;
+		auto             first = m_maps.upper_bound(vaddr);
+		if (first == m_maps.begin()) {
+			return false;
+		}
+		--first;
+		auto current = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) {
+				return false;
+			}
+			const auto& entry  = mapping->second;
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto  offset = entry.backing_offset + current - entry.vaddr;
+			if (!RangeOk(offset, bytes)) {
+				return false;
+			}
+			if (!segments.empty() && segments.back().first + segments.back().second == offset) {
+				segments.back().second += bytes;
+			} else {
+				segments.emplace_back(offset, bytes);
+			}
 			current += bytes;
 		}
 		return true;
@@ -782,6 +827,14 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
+
+	bool GetBackingSegments(uint64_t vaddr, uint64_t size,
+	                        std::vector<std::pair<uint64_t, uint64_t>>& segments) {
+		return m_backing->GetBackingSegments(vaddr, size, segments);
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	[[nodiscard]] int GetBackingFd() const { return m_backing->GetFd(); }
+#endif
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {

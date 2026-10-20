@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/host_gpu/sharedMemory.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -39,6 +40,9 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// Takes ownership of memory shared with guest memory at cpu_address.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       uint64_t size, SharedMemory shared);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,7 +52,8 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] bool               IsShared() const noexcept { return m_shared.IsValid(); }
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept;
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -67,11 +72,24 @@ public:
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// Records a write of at most 64 KiB, ordered with the surrounding GPU work.
+	void Update(uint64_t offset, uint64_t size, const void* data);
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Sharing state: buffers the CPU rewrites every frame alias guest memory instead.
+	bool gpu_written = false;
+	// The command processor reads draw arguments from this buffer.
+	bool     command_readback     = false;
+	bool     share_failed         = false;
+	uint32_t cpu_access_frames    = 0;
+	uint8_t  cpu_access_history   = 0;
+	uint32_t recent_downloads     = 0;
+	uint64_t download_window_tick = 0;
+	uint64_t last_cpu_access_tick = UINT64_MAX;
+	uint64_t last_gpu_write_tick  = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -82,16 +100,17 @@ private:
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
 
-	GraphicContext*               m_graphics    = nullptr;
-	CommandScheduler*             m_scheduler   = nullptr;
-	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
-	uint64_t                      m_cpu_address = 0;
-	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
-	std::span<uint8_t>            m_mapped;
+	GraphicContext*    m_graphics       = nullptr;
+	CommandScheduler*  m_scheduler      = nullptr;
+	MemoryUsage        m_usage          = MemoryUsage::DeviceLocal;
+	uint64_t           m_cpu_address    = 0;
+	vk::DeviceAddress  m_device_address = 0;
+	vk::Buffer         m_buffer         = nullptr;
+	VmaAllocation      m_allocation     = nullptr;
+	SharedMemory       m_shared;
+	uint64_t           m_size;
+	bool               m_coherent = false;
+	std::span<uint8_t> m_mapped;
 };
 
 class StreamBuffer final: public Buffer {

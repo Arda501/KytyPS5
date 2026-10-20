@@ -407,6 +407,45 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuModifiedRangeQueue() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  Check(!tracker.TakeCpuModifiedRanges(ranges),
+        "a fresh tracker did not request a full synchronization");
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.size() == 1 &&
+            ranges[0].first ==
+                address / Libs::Graphics::TRACKER_REGION_SIZE *
+                    Libs::Graphics::TRACKER_REGION_SIZE &&
+            ranges[0].second == Libs::Graphics::TRACKER_REGION_SIZE,
+        "region creation did not queue the new CPU-modified region");
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "taking queued ranges did not clear them");
+
+  tracker.InvalidateRegion(address, page_size, [] {});
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.size() == 1 &&
+            ranges[0].first == address && ranges[0].second == page_size * 2,
+        "adjacent CPU-modified ranges were not queued and merged");
+
+  for (size_t i = 0; i <= 16384; i++) {
+    tracker.QueueCpuModifiedRange(address + (i % 2) * page_size * 2, 1);
+  }
+  Check(!tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "queue overflow did not request a full synchronization");
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "overflow state survived a full synchronization");
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1202,6 +1241,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuModifiedRangeQueue();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

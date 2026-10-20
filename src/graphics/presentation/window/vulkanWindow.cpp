@@ -1,6 +1,3 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -19,12 +16,16 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -50,6 +51,7 @@ struct VulkanExtensions {
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
 	features.storageBuffer16BitAccess = VK_TRUE;
+	features.shaderDrawParameters     = VK_TRUE;
 	return features;
 }
 
@@ -496,7 +498,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (conditional_rendering_extension) {
+		conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &conditional_rendering;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering == VK_TRUE;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -654,7 +664,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext = &maintenance8;
+		create_info.pNext  = &maintenance8;
+	}
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext                         = const_cast<void*>(create_info.pNext);
+		conditional_rendering.inheritedConditionalRendering = VK_FALSE;
+		create_info.pNext                                   = &conditional_rendering;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -996,7 +1011,11 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
-	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
+	const auto&        device_properties = graphic_ctx.GetPhysicalDeviceProperties();
+	constexpr uint32_t AmdVendorId       = 0x1002;
+	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(
+	    device_properties.vendorID == AmdVendorId &&
+	    std::getenv("KYTY_EMULATED_FLOAT_MIN_MAX") == nullptr);
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 
@@ -1024,13 +1043,21 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
-		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
-		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+#if !defined(__APPLE__) && !defined(_WIN32)
+		if (HasExtension(available_extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+			graphic_ctx.dma_buf_import_enabled = true;
+		}
+#endif
+		for (const auto* extension:
+		     {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		      VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		      VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+		      VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		      VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+		      VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <atomic>
@@ -667,7 +666,34 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+// Loads a Vulkan draw parameter (BaseVertex or BaseInstance) as an unsigned value.
+uint32_t EmitDrawParameter(EmitterState& state, uint32_t index) {
+	auto& variable = state.draw_parameter_variables[index];
+	if (variable == 0) {
+		state.builder.RequireCapability(spv::CapabilityDrawParameters);
+		variable = DefineInterfaceVariable(state, TypeI32(state), spv::StorageClassInput,
+		                                   index == 0 ? "gl_BaseVertex" : "gl_BaseInstance");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            index == 0 ? spv::BuiltInBaseVertex : spv::BuiltInBaseInstance);
+	}
+	const auto value = state.builder.AllocateId();
+	const auto bits  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+	return bits;
+}
+
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	if (const auto* vertex = state.input_info.vertex;
+	    vertex != nullptr && state.program.stage == ShaderType::Vertex) {
+		const auto slot = static_cast<int64_t>(IR::RegIndex(reg)) - state.program.user_data_base;
+		for (uint32_t index = 0; index < 2; index++) {
+			if (vertex->draw_parameter_user_data[index] >= 0 &&
+			    slot == vertex->draw_parameter_user_data[index]) {
+				return EmitDrawParameter(state, index);
+			}
+		}
+	}
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {

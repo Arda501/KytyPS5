@@ -25,6 +25,11 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Queues a range whose CPU-modified pages must be checked by TakeCpuModifiedRanges.
+	void QueueCpuModifiedRange(uint64_t vaddr, uint64_t size) noexcept;
+	// Moves the ranges that may have become CPU-modified since the previous call into out.
+	// Returns false when the queue overflowed and every tracked page must be checked.
+	[[nodiscard]] bool TakeCpuModifiedRanges(std::vector<std::pair<uint64_t, uint64_t>>& out);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
@@ -45,6 +50,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				QueueCpuModifiedRange(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			if (should_flush) {
@@ -105,7 +111,9 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
-	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	// Write faults arrive in signal context, so the queue has a fixed size and never allocates.
+	static constexpr size_t                         PENDING_RANGE_CAPACITY = 16384;
+	inline static thread_local const MemoryTracker* s_upload_owner         = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
@@ -146,10 +154,14 @@ private:
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
-	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
-	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
-	std::mutex                                     m_region_mutex;
-	PageManager&                                   m_page_manager;
+	std::unique_ptr<std::atomic<RegionManager*>[]>   m_regions;
+	std::vector<std::unique_ptr<RegionManager>>      m_region_storage;
+	std::mutex                                       m_region_mutex;
+	PageManager&                                     m_page_manager;
+	TrackingSpinLock                                 m_pending_lock;
+	std::unique_ptr<std::pair<uint64_t, uint64_t>[]> m_pending_ranges;
+	size_t                                           m_pending_count    = 0;
+	bool                                             m_pending_overflow = true;
 };
 
 } // namespace Libs::Graphics
