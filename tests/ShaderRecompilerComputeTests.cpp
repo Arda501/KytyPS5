@@ -44928,6 +44928,28 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
 
+  // RADV rejects 3D 128-bit BC images with block-texel views plus extended usage.
+  auto volume_info = MakeInfo(vk::Format::eBc7UnormBlock, 1, 1);
+  volume_info.guest_format = Prospero::BufferFormat::kBc7UNorm;
+  volume_info.type = Prospero::ImageType::kColor3D;
+  volume_info.extent.depth = 4;
+  volume_info.bytes_per_block = 16;
+  const bool block_texel_view = context.supports_block_texel_view;
+  for (const bool supported : {block_texel_view, false}) {
+    context.supports_block_texel_view = supported;
+    Image volume(context, scheduler, volume_info);
+    const auto flags = volume.backing.flags;
+    Require(name, "block volume create flags",
+            (flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) ==
+                    supported &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eExtendedUsage) ==
+                    static_cast<bool>(volume.backing.usage &
+                                      vk::ImageUsageFlagBits::eStorage),
+            "block volume requested extended usage without storage");
+  }
+  context.supports_block_texel_view = block_texel_view;
+
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =
       image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
