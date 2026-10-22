@@ -44934,8 +44934,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
   volume_info.type = Prospero::ImageType::kColor3D;
   volume_info.extent.depth = 4;
   volume_info.bytes_per_block = 16;
-  const bool block_texel_view = context.supports_block_texel_view;
-  for (const bool supported : {block_texel_view, false}) {
+  for (const bool supported : {false, context.supports_block_texel_view}) {
     context.supports_block_texel_view = supported;
     Image volume(context, scheduler, volume_info);
     const auto flags = volume.backing.flags;
@@ -44948,7 +44947,6 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                       vk::ImageUsageFlagBits::eStorage),
             "block volume requested extended usage without storage");
   }
-  context.supports_block_texel_view = block_texel_view;
 
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =
